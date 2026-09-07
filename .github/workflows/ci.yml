@@ -1,0 +1,275 @@
+# test → image.
+#
+# Two stages, not the three the Go backend has. There is no build stage because
+# there is nothing to compile: the artefact IS the image, so building it and
+# building the deliverable are the same step. Inventing a third stage for
+# symmetry would only add a job that proves nothing.
+#
+#   test   the vocabulary assertions, both test suites, and a compile pass
+#   image  built, exercised while running, and pushed to Docker Hub from the
+#          `production` environment
+#
+# ---------------------------------------------------------------------------
+# This file only does anything once llm_agents_call is a repository root
+# ---------------------------------------------------------------------------
+#
+# GitHub reads .github/workflows/ from the root of a repository and nowhere
+# else. Today this directory is an untracked folder inside the monorepo working
+# tree — `git ls-files llm_agents_call/` is empty — so nothing here runs yet.
+# It is written now for the same reason web/.github/workflows/ci.yml sits at
+# what looks like a subdirectory: that directory is a repository root, and this
+# one is meant to become one.
+#
+# ---------------------------------------------------------------------------
+# What CI cannot check, and why it is not an oversight
+# ---------------------------------------------------------------------------
+#
+# enums.py is generated from the backend's migrations by generate_enums.py,
+# which reads ../backend/internal/platform/postgres/sql. Once this is its own
+# repository that path does not exist, so CI cannot regenerate the file and
+# cannot prove it is current. The check the backend gets from
+# `make verify-migrations` has no equivalent here.
+#
+# What survives is narrower but not nothing: extract.py asserts at import that
+# its two vocabulary tables have exactly the keys of the generated enums, so a
+# regenerated enums.py that no longer matches the word lists fails every job
+# below at the import. What that cannot catch is enums.py being *stale* —
+# correct against itself, behind the database. That happened once already:
+# org_type gained PRIVATE in migration 0024 and the generator, reading only
+# 0001, never saw it.
+#
+# So regeneration stays a deliberate local step from the monorepo tree:
+#
+#     python3 llm_agents_call/generate_enums.py && python3 llm_agents_call/test_extract.py
+#
+# Give this job a real check by having it check out the backend repository
+# beside this one and run the generator — that needs a token with read access to
+# indicsign/sp-backend, which is a decision rather than a detail.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same ref makes this run's answer irrelevant before it
+# finishes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Matches the Dockerfile. The code needs 3.10 for `X | None` and nothing
+  # newer; testing on the version the image runs is what matters.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+
+  # ===========================================================================
+  # Stage 1 — test
+  # ===========================================================================
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-service.txt
+
+      - name: Install
+        # httpx on top of the service's own dependencies: starlette's TestClient
+        # needs it, and it is a test dependency rather than a runtime one, so it
+        # is not in requirements-service.txt.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-service.txt httpx
+
+      - name: Everything compiles
+        # Catches a syntax error in a module no test imports. Cheap, and it is
+        # the whole of what a compile step can mean for Python.
+        run: python -m compileall -q .
+
+      # The keyless reader, which is still doing real work: it re-reads every
+      # page the model reads and disagreements are surfaced to the operator.
+      # Its import also runs the two vocabulary assertions.
+      - name: The reader still reads
+        run: python test_extract.py
+
+      # Authentication, the JSON salvaging, and the rule validation. No model
+      # is called — what is worth testing without a key is everything that
+      # decides whether a request may spend one.
+      - name: The service's edges
+        run: python test_service.py
+
+  # ===========================================================================
+  # Stage 2 — image
+  # ===========================================================================
+
+  image:
+    name: image
+    needs: test
+    runs-on: ubuntu-latest
+
+    # The environment holding DOCKER_USERNAME and DOCKER_PASSWORD. Its
+    # deployment branch rules apply on top of the `if` below, so the protection
+    # survives someone editing this file.
+    environment: production
+
+    # Declared here, not at workflow level: the `secrets` context is not
+    # available in a workflow-level `env` block, so a secret-derived image name
+    # has to be scoped to the job.
+    #
+    # A Docker Hub personal namespace IS the account name, so DOCKER_USERNAME is
+    # the right namespace whenever the image belongs to the pushing account. Set
+    # the repository variable IMAGE_NAME to `namespace/name` to override — an
+    # organisation-owned image needs it.
+    env:
+      IMAGE: ${{ vars.IMAGE_NAME || format('{0}/sp-discovery', secrets.DOCKER_USERNAME) }}
+      # A throwaway, for the running checks below. It is not a credential: it
+      # authenticates nothing beyond this container, which is destroyed at the
+      # end of the job and never had a Gemini key to protect.
+      SMOKE_TOKEN: ci-smoke-token-not-a-secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built and loaded locally first, because an image that builds and does
+      # not run is not a passing result and there is no point publishing it
+      # before that is known. The push below reuses this build.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Runs unprivileged
+        run: |
+          who=$(docker run --rm ${{ env.IMAGE }}:${{ github.sha }} id -un)
+          echo "runs as: $who"
+          [ "$who" != "root" ] || { echo "the image runs as root"; exit 1; }
+
+      - name: Start it
+        run: |
+          docker run -d --name discovery \
+            -e DISCOVERY_TOKEN="$SMOKE_TOKEN" \
+            -e PORT=8080 -p 8080:8080 \
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+          # uvicorn is up in about a second; ten one-second attempts is slack
+          # for a cold runner without making a genuine failure take a minute.
+          for i in $(seq 1 10); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error title=Service did not start::No answer on /healthz after 10s."
+          docker logs discovery
+          exit 1
+
+      - name: Health says what it is, and no more
+        run: |
+          body=$(curl -fsS http://localhost:8080/healthz)
+          echo "$body"
+
+          # key_configured is a boolean rather than a masked key, on purpose: a
+          # mask is still four characters of a live credential in a log line
+          # nobody treats as sensitive because it came from a health check.
+          echo "$body" | grep -q '"key_configured":false' \
+            || { echo "::error::healthz should report no key in CI"; exit 1; }
+          echo "$body" | grep -qi 'AIza\|AQ\.' \
+            && { echo "::error::healthz leaked something key-shaped"; exit 1; }
+          echo "ok: reports its state without echoing a credential"
+
+      # The property most worth guarding. This service holds a Gemini key and
+      # will spend it for anyone who can reach it, and its Railway URL is not a
+      # secret — so a regression that made a route public is the expensive one.
+      - name: Every route but health refuses an unauthenticated caller
+        run: |
+          for path in /queries /search /classify /extract; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+                     -X POST -H 'Content-Type: application/json' \
+                     -d '{}' "http://localhost:8080$path")
+            # 401 unauthenticated, 405 wrong method for the GET-only /queries.
+            # Both are refusals. 200 is the failure this step exists for.
+            case "$code" in
+              401|405) echo "ok: $path refused ($code)" ;;
+              *) echo "::error title=Route not protected::$path answered $code without a token"
+                 docker logs discovery
+                 exit 1 ;;
+            esac
+          done
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/queries)
+          [ "$code" = "401" ] || {
+            echo "::error::GET /queries answered $code without a token"; exit 1; }
+          echo "ok: GET /queries refused (401)"
+
+      - name: A good token is served
+        run: |
+          # tr strips the leading whitespace some wc implementations print,
+          # which would otherwise make `-ge` an "integer expression expected".
+          count=$(curl -fsS -H "X-Discovery-Token: $SMOKE_TOKEN" \
+                    http://localhost:8080/queries | grep -o '","' | wc -l | tr -d ' ')
+          echo "seed queries returned: $((count + 1))"
+          [ "$count" -ge 10 ] || {
+            echo "::error::the seed query list came back short"; exit 1; }
+
+      - name: Stop it
+        if: always()
+        run: docker rm -f discovery || true
+
+      # --- publish ------------------------------------------------------------
+      #
+      # Only from main, and only after the checks above. A pull request builds
+      # the image and exercises it, but never publishes one.
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push
+        if: github.ref == 'refs/heads/main'
+        # `denied: requested access to the resource is denied` arrives AFTER a
+        # successful login, so it never means the credentials are wrong. It
+        # means the namespace does not exist, or the account cannot write to it.
+        run: |
+          set -o pipefail
+
+          # The commit tag is the one to deploy from — it names exactly one
+          # build. `latest` moves, which is convenient for a pull and useless
+          # for knowing what is running.
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+
+          if ! docker push "$IMAGE:$GITHUB_SHA"; then
+            echo "::error title=Push denied::The registry refused the write. The \
+          credentials authenticated, so the destination is what to check: the namespace \
+          must exist on Docker Hub and the account must be able to write to it. It \
+          defaults to DOCKER_USERNAME; set the repository variable IMAGE_NAME to \
+          'namespace/name' if the image belongs to an organisation instead. Also confirm \
+          DOCKER_PASSWORD is a token with Read & Write scope — a read-only token logs in \
+          successfully and then fails exactly like this."
+            exit 1
+          fi
+          docker push "$IMAGE:latest"

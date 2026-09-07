@@ -1,0 +1,33 @@
+# The build context, kept to what the Dockerfile actually COPYs.
+#
+# .venv is the reason this file exists. It is a virtualenv built on a laptop —
+# tens of megabytes, and currently broken besides: its interpreter symlink
+# points at Indic_scholarship/AI/.venv/bin/python3.14, a path that stopped
+# existing when the directory was renamed. Shipping it to the Docker daemon
+# costs seconds on every build and could only ever confuse the image.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets. The Dockerfile copies neither, but a build context is not a private
+# thing — anything in it can be read out of the image's history by whoever can
+# pull the image, so the safe place for it is "not in the context at all".
+.env
+.env.*
+!.env.example
+
+# Run state: seen URLs and proposals from local CLI runs. Nothing the service
+# reads — it holds no state — and a stale seen.json baked into an image would
+# be actively wrong.
+state/
+
+# Tests and the CLI pipeline stay out for the same reason the Dockerfile does
+# not COPY them: generate_enums.py reads the backend's migrations, which are not
+# in this context, so a file that cannot run is a file somebody will try to run.
+test_*.py
+pipeline.py
+generate_enums.py
+
+.git/
+.github/

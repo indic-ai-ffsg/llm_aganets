@@ -1,0 +1,11 @@
+# Secrets. GEMINI_API_KEY and DISCOVERY_TOKEN live here; the repo is public.
+.env
+
+# Virtualenv and Python build artefacts.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state. seen.json is a discovery watermark, not source.
+state/

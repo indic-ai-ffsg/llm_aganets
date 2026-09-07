@@ -1,0 +1,21 @@
+# What the service needs, and nothing else.
+#
+# Separate from requirements.txt, which is a pip freeze of a different
+# environment: it carries 130 packages this has no use for and one line that
+# makes it unbuildable anywhere but the laptop it was written on —
+#
+#     -e /Users/sudip/hive/core
+#
+# An editable install of a path that does not exist in the image fails the
+# build with an error naming somebody's home directory. requirements.txt is
+# left alone because it is presumably still describing that environment; it is
+# just not the input to a Dockerfile.
+#
+# Floors rather than exact pins, deliberately and temporarily: a pin is only
+# worth having if it is a version somebody has actually resolved, and these
+# have not been installed yet. Run `pip freeze` inside the first image that
+# builds green and replace this file with the result.
+
+fastapi>=0.115
+uvicorn[standard]>=0.34
+google-genai>=1.0
