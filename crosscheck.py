@@ -46,7 +46,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extract  # noqa: E402
 
-UA = "IndicAI-scholarship-discovery/1.0 (+https://indic-ai.org)"
+UA = "IndicAI-scholarship-discovery/1.0 (+https://scholarship.indic-ai.org)"
 
 # Enough of a notice to hold its eligibility table. A few pages are megabytes of
 # inline script; reading all of it to regex 2 KB of prose is waste, and the cap

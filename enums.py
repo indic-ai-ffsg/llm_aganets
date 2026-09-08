@@ -42,21 +42,11 @@ class CourseLevel(str, Enum):
     POSTGRADUATE = "POSTGRADUATE"
     DOCTORAL = "DOCTORAL"
 
-
-class SocialCategory(str, Enum):
-    GENERAL = "GENERAL"
-    EWS = "EWS"
-    OBC = "OBC"
-    SC = "SC"
-    ST = "ST"
-
-
 class SponsorType(str, Enum):
     NGO = "NGO"
     CORPORATE = "CORPORATE"
     GOVERNMENT = "GOVERNMENT"
     PRIVATE = "PRIVATE"
-
 
 def values(enum_cls) -> list[str]:
     return [e.value for e in enum_cls]
@@ -64,5 +54,4 @@ def values(enum_cls) -> list[str]:
 
 DISABILITY_TYPES = values(DisabilityType)
 COURSE_LEVELS = values(CourseLevel)
-SOCIAL_CATEGORIES = values(SocialCategory)
 SPONSOR_TYPES = values(SponsorType)
