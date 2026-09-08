@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import crosscheck  # noqa: E402
 import llm  # noqa: E402
 import service  # noqa: E402
+import vocab  # noqa: E402
 
 PASS = FAIL = 0
 client = TestClient(service.app)
@@ -126,6 +127,98 @@ made = llm._clean_rules(
 check("short sentence is replaced", made[0]["description"],
       "This scheme needs a certified disability of 75% or more.")
 check("and the operator is told", any("generated from the rule" in i for i in generated), True)
+
+
+print("\nThe comparison is the field's, not the model's")
+# The failure this section exists for: `annual_family_income GTE 10000` is a
+# well-formed rule the API accepts and the matcher evaluates, and it inverts who
+# the scheme is for. Nothing downstream reads as wrong, which is why it has to be
+# caught here.
+reversed_op: list[str] = []
+flipped = llm._clean_rules([{
+    "field": "annual_family_income", "op": "GTE", "value": 250000,
+    "description": "This scheme is for families earning Rs 2.5 lakh a year or more.",
+}], reversed_op)
+
+check("a reversed comparison is corrected, not accepted",
+      [r["op"] for r in flipped], ["LTE"])
+check("the rule survives it", [r["value"] for r in flipped], [250000])
+check("and the operator is told what the model said",
+      any("proposed GTE" in i for i in reversed_op), True)
+check("and told to re-check the figure",
+      any("wrong sentence" in i for i in reversed_op), True)
+# The sentence went with it, because it is the one a refused student reads and
+# it was written to describe the reversed rule.
+check("the contradicting refusal sentence is replaced",
+      flipped[0]["description"],
+      "This scheme is for families with an annual income of \u20b92,50,000 or less.")
+check("and that replacement is reported too",
+      any("said the opposite of the rule" in i for i in reversed_op), True)
+
+# Indian grouping, because a refused student reads this sentence and the whole
+# platform pins en-IN for that reason (admin/src/lib/format.ts).
+check("a lakh figure groups the Indian way", llm._rupees(250000), "2,50,000")
+check("and so does a crore", llm._rupees(15000000), "1,50,00,000")
+check("under a thousand is left alone", llm._rupees(900), "900")
+
+# The floor field, the other way round.
+floored: list[str] = []
+llm._clean_rules([{
+    "field": "disability_percent", "op": "LTE", "value": 40,
+    "description": "This scheme is for students with up to 40% disability.",
+}], floored)
+check("a disability percentage is a floor, however it arrives",
+      any("proposed LTE" in i for i in floored), True)
+
+# The ordinary case has to stay silent, or the panel fills with notes nobody
+# reads and the real ones are lost among them.
+quiet: list[str] = []
+right = llm._clean_rules([{
+    "field": "annual_family_income", "op": "LTE", "value": 250000,
+    "description": "This scheme is for families earning under Rs 2.5 lakh a year.",
+}], quiet)
+check("the right comparison passes", [r["op"] for r in right], ["LTE"])
+check("and says nothing", quiet, [])
+check("and keeps the notice's own wording", right[0]["description"],
+      "This scheme is for families earning under Rs 2.5 lakh a year.")
+
+# The model is no longer asked for an operator at all, so most rules arrive
+# without one.
+absent: list[str] = []
+filled = llm._clean_rules([{
+    "field": "course_level", "value": ["UNDERGRADUATE"],
+    "description": "This scheme is for undergraduate students.",
+}], absent)
+check("a rule with no operator gets the field's", [r["op"] for r in filled], ["IN"])
+check("and that is not worth a note", absent, [])
+
+
+print("\nThe vocabulary tables agree with each other")
+# All three are import-time assertions in vocab.py; asserting them here as well
+# is what makes a failure say which one, in a suite somebody runs, rather than
+# only killing the container.
+check("every proposable field has a meaning for the prompt",
+      set(vocab.PROPOSABLE_RULES) ^ set(vocab.RULE_MEANING), set())
+check("every declared operator is one the API accepts",
+      {op for op in vocab.PROPOSABLE_RULES.values()} - vocab.RULE_OPS, set())
+check("every set-valued field has a domain to check against",
+      {f for f, op in vocab.PROPOSABLE_RULES.items()
+       if op in ("IN", "NOT_IN") and f not in vocab.CHOICE_DOMAINS}, set())
+
+# enums.py is generated and committed, and has now fallen behind the migrations
+# twice. The second time nothing here could start at all — vocab asked for a
+# name enums did not define. This is the message that failure produces now.
+try:
+    import enums as _enums
+    _held = _enums.SOCIAL_CATEGORIES
+    del _enums.SOCIAL_CATEGORIES
+    try:
+        vocab._generated("SOCIAL_CATEGORIES")
+        check("a stale enums.py names the fix", "no error", "ImportError")
+    except ImportError as e:
+        check("a stale enums.py names the fix", "generate_enums.py" in str(e), True)
+finally:
+    _enums.SOCIAL_CATEGORIES = _held
 
 
 print("\nA notice with no stated threshold gets no threshold")

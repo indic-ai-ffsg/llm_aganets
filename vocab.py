@@ -20,6 +20,44 @@ wins: it is the editor an operator actually types into.
 
 from __future__ import annotations
 
+
+def _generated(name: str) -> list[str]:
+    """A list out of enums.py, with a failure that names the fix.
+
+    enums.py is generated from the backend's migrations, committed, and read at
+    import by every module here. When it falls behind, the symbol is simply not
+    there and what anybody sees is
+
+        ImportError: cannot import name 'SOCIAL_CATEGORIES' from 'enums'
+
+    raised three modules deep, from a service that then cannot start at all —
+    no route answers, /healthz included, so the failure looks like a dead
+    container rather than a stale file.
+
+    That is not hypothetical. social_category was added to generate_enums.py's
+    WANTED table and enums.py was never regenerated, so vocab, extract,
+    crosscheck, llm, pipeline and the FastAPI app all failed to import, and
+    every test in both suites failed to collect.
+
+    Nothing here can repair it — this file has no idea what the missing values
+    are, and guessing them is exactly what generating the file exists to
+    prevent. What it can do is stop the message being a puzzle.
+    """
+    import enums
+
+    try:
+        return getattr(enums, name)
+    except AttributeError:
+        raise ImportError(
+            f"enums.py does not define {name}. It is generated from the "
+            "backend's migrations and has fallen behind them.\n\n"
+            "From the monorepo tree, run:\n"
+            "    python3 llm_agents_call/generate_enums.py\n\n"
+            "`generate_enums.py --check` answers whether it is current without "
+            "writing anything."
+        ) from None
+
+
 # The states and union territories by the code stored on a profile.
 #
 # DH, not DN, for Dadra and Nagar Haveli: the two union territories merged in
@@ -69,17 +107,45 @@ PROPOSABLE_RULES: dict[str, str] = {
     "social_category": "IN",
 }
 
+# What a value on each of those fields means, in the terms a notice uses.
+#
+# This is the prompt's half of the table above: that one fixes the comparison,
+# and this says what the comparison is for. They are separate because they are
+# read by different things — the matcher needs the operator, the model needs the
+# meaning — and identical in their keys, which is asserted below.
+#
+# The model is given this and not the operator. Handed "annual_family_income
+# (LTE)" it would sometimes answer GTE, and a reversed income comparison is the
+# worst failure this pipeline has: a scheme for families under ₹2.5 lakh becomes
+# a scheme for families over it. Nothing downstream reads as wrong — the rule is
+# well-formed, the API takes it, the matcher evaluates it — and the students it
+# was written for are the ones it turns away.
+RULE_MEANING: dict[str, str] = {
+    "disability_percent":
+        "the minimum certified percentage the notice requires — a floor",
+    "disability_type":
+        "the conditions accepted; leave it out if the notice accepts any",
+    "annual_family_income":
+        "the highest annual family income allowed — a ceiling, in whole rupees",
+    "course_level":
+        "the levels of study accepted",
+    "state_code":
+        "the states of domicile accepted, as two-letter codes",
+    "gender":
+        "the genders accepted; leave it out for a scheme open to everyone",
+    "social_category":
+        "the categories accepted; leave it out if the notice accepts any",
+}
+
 # What the engine reads each choice field against, so a proposal can be checked
 # before it is ever sent. Filled from enums.py at import rather than retyped —
 # the point of generating that file is that this list cannot drift from the
 # database.
 def _choice_domains() -> dict[str, frozenset[str]]:
-    from enums import COURSE_LEVELS, DISABILITY_TYPES, SOCIAL_CATEGORIES
-
     return {
-        "disability_type": frozenset(DISABILITY_TYPES),
-        "course_level": frozenset(COURSE_LEVELS),
-        "social_category": frozenset(SOCIAL_CATEGORIES),
+        "disability_type": frozenset(_generated("DISABILITY_TYPES")),
+        "course_level": frozenset(_generated("COURSE_LEVELS")),
+        "social_category": frozenset(_generated("SOCIAL_CATEGORIES")),
         "state_code": VALID_STATE_CODES,
         # Not an enum in enums.py because no generated type covers it: the
         # profile column is `gender` and these are the four stored values.
@@ -104,9 +170,38 @@ def _sponsor_types() -> frozenset[str]:
     grown once — 0024 added PRIVATE — and a literal here would be the third
     place that value has to be remembered.
     """
-    from enums import SPONSOR_TYPES as generated
-
-    return frozenset(generated)
+    return frozenset(_generated("SPONSOR_TYPES"))
 
 
 SPONSOR_TYPES: frozenset[str] = _sponsor_types()
+
+
+# --- what has to hold between the tables above ---------------------------------
+#
+# Checked at import, like extract.py's own vocabulary assertions and for the
+# same reason: these tables are edited by hand, by different hands, and every
+# way they can disagree produces a proposal that is refused or, worse, quietly
+# wrong. Failing here costs a container start; failing later costs a listing.
+
+_missing_meaning = set(PROPOSABLE_RULES) ^ set(RULE_MEANING)
+if _missing_meaning:
+    raise ImportError(
+        "PROPOSABLE_RULES and RULE_MEANING must describe the same fields; these "
+        f"are in one and not the other: {', '.join(sorted(_missing_meaning))}")
+
+_bad_ops = {f: op for f, op in PROPOSABLE_RULES.items() if op not in RULE_OPS}
+if _bad_ops:
+    raise ImportError(
+        "PROPOSABLE_RULES declares operators the API will not accept: "
+        + ", ".join(f"{f}={op}" for f, op in sorted(_bad_ops.items())))
+
+# A choice field with no domain cannot be validated, so its values would reach
+# the API unchecked — which is the one thing this file exists to prevent.
+_undomained = {
+    f for f, op in PROPOSABLE_RULES.items()
+    if op in ("IN", "NOT_IN") and f not in CHOICE_DOMAINS
+}
+if _undomained:
+    raise ImportError(
+        "these fields take a set of values and have no domain to check them "
+        f"against: {', '.join(sorted(_undomained))}")

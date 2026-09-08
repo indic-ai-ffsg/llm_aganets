@@ -25,7 +25,9 @@ validation gate rather than fuzzy-matched into something plausible.
 
 from __future__ import annotations
 
+import difflib
 import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -135,10 +137,51 @@ def render(found: dict[str, list[str]]) -> str:
 
 
 def main() -> None:
+    """Write enums.py, or with --check only report whether it is current.
+
+    --check exists because the failure it catches has now happened twice, and
+    the second time took the whole service down rather than narrowing it.
+
+    The first was silent: org_type gained PRIVATE in 0024, the generator read
+    only 0001, and this pipeline refused a value the API would have accepted.
+    The second was not silent at all — social_category was added to WANTED and
+    the file was never regenerated, so vocab.py asked enums.py for a name it did
+    not have and every module here, the FastAPI app included, failed to import.
+
+    Both are the same fault: a generated file is committed beside the thing it
+    is generated from, and nothing compares them. Writing the file is a decision
+    somebody has to make; asking whether it is current is not, so it is separated
+    out here and can be run anywhere the migrations are on disk — which is the
+    monorepo tree, and is where regeneration happens anyway.
+    """
+    check_only = "--check" in sys.argv[1:]
+
     if not SQL_DIR.is_dir():
-        raise SystemExit(f"cannot find {SQL_DIR}")
+        raise SystemExit(
+            f"cannot find {SQL_DIR}.\n"
+            "The migrations are in the backend repository; this needs a tree "
+            "where both are checked out beside each other.")
+
     found = read_enums(SQL_DIR)
-    OUT.write_text(render(found))
+    fresh = render(found)
+
+    if check_only:
+        current = OUT.read_text() if OUT.exists() else ""
+        if current == fresh:
+            print(f"{OUT.name} is current — {len(found)} enums, "
+                  f"{sum(len(v) for v in found.values())} values")
+            return
+        # A diff rather than "they differ": the answer to "what changed" is the
+        # only thing that says whether this is a value the database gained or a
+        # hand edit somebody made to a generated file.
+        print(f"{OUT.name} is NOT current. What the migrations say it should be:\n")
+        sys.stdout.writelines(difflib.unified_diff(
+            current.splitlines(keepends=True), fresh.splitlines(keepends=True),
+            fromfile=f"{OUT.name} (committed)", tofile=f"{OUT.name} (generated)"))
+        raise SystemExit(
+            f"\nRun `python3 {Path(__file__).name}` to write it.")
+
+    OUT.write_text(fresh)
     total = sum(len(v) for v in found.values())
     print(f"wrote {OUT.relative_to(ROOT)} — {len(found)} enums, {total} values")
     for name, vals in found.items():

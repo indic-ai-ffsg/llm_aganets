@@ -25,26 +25,41 @@
 # ---------------------------------------------------------------------------
 #
 # enums.py is generated from the backend's migrations by generate_enums.py,
-# which reads ../backend/internal/platform/postgres/sql. Once this is its own
-# repository that path does not exist, so CI cannot regenerate the file and
-# cannot prove it is current. The check the backend gets from
-# `make verify-migrations` has no equivalent here.
+# which reads ../backend/internal/platform/postgres/sql. In this repository that
+# path does not exist, so CI cannot regenerate the file and cannot prove it is
+# current. The check the backend gets from `make verify-migrations` cannot run
+# here.
 #
-# What survives is narrower but not nothing: extract.py asserts at import that
-# its two vocabulary tables have exactly the keys of the generated enums, so a
-# regenerated enums.py that no longer matches the word lists fails every job
-# below at the import. What that cannot catch is enums.py being *stale* —
-# correct against itself, behind the database. That happened once already:
-# org_type gained PRIVATE in migration 0024 and the generator, reading only
-# 0001, never saw it.
+# What does run here is narrower and turned out to be enough. extract.py asserts
+# at import that its two vocabulary tables have exactly the keys of the generated
+# enums, and vocab.py reads four lists out of enums.py at import — so a file that
+# has fallen behind fails both test steps below before either of them runs a
+# case. That is not a hypothetical:
 #
-# So regeneration stays a deliberate local step from the monorepo tree:
+#   0024 added PRIVATE to org_type and the generator, reading only 0001, never
+#   saw it. Silent: the pipeline refused a value the API would have taken.
 #
-#     python3 llm_agents_call/generate_enums.py && python3 llm_agents_call/test_extract.py
+#   social_category was added to the generator's WANTED table and enums.py was
+#   never regenerated. Not silent at all — vocab.py asked for a name that was
+#   not there, every module failed to import, both suites failed to collect, and
+#   this workflow went red and stayed red.
 #
-# Give this job a real check by having it check out the backend repository
-# beside this one and run the generator — that needs a token with read access to
-# indicsign/sp-backend, which is a decision rather than a detail.
+# The gap was never detection. It was that a red CI reports `ImportError: cannot
+# import name 'SOCIAL_CATEGORIES'` from three modules deep, which does not look
+# like "a generated file is behind" to anybody who did not write the generator.
+# vocab.py now raises that as a sentence naming the command to run, and the
+# generator has a --check that answers the question without writing anything:
+#
+#     python3 llm_agents_call/generate_enums.py --check    # exits 1 with a diff
+#     python3 llm_agents_call/generate_enums.py            # writes it
+#
+# Both need the monorepo tree, where the migrations are on disk. Regenerating
+# therefore stays a deliberate local step, and --check is what makes it one
+# somebody can run before pushing rather than after CI has told them off.
+#
+# Giving this job the real check means checking the backend repository out beside
+# this one and running the generator, which needs a token with read access to
+# indicsign/sp-backend — a decision rather than a detail.
 
 name: CI
 

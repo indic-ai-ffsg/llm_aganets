@@ -48,7 +48,7 @@ from enums import COURSE_LEVELS, DISABILITY_TYPES  # noqa: E402
 # twelve months is a third one to keep in step.
 from extract import MONTHS  # noqa: E402
 from vocab import (  # noqa: E402
-    AWARD_BASES, CHOICE_DOMAINS, PROPOSABLE_RULES, RULE_OPS, SPONSOR_TYPES,
+    AWARD_BASES, CHOICE_DOMAINS, PROPOSABLE_RULES, RULE_MEANING, SPONSOR_TYPES,
 )
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
@@ -455,6 +455,37 @@ class Proposal:
     issues: list[str] = field(default_factory=list)
 
 
+def _rupees(value) -> str:
+    """A rupee figure in Indian digit grouping: 250000 -> 2,50,000.
+
+    Not f"{n:,}", which was what this used and which writes 250,000.
+
+    The sentence this ends up in is what a student who does not qualify is shown
+    in place of the scheme, so it is read by the person the platform most owes a
+    clear answer to. "2,50,000" reads as two and a half lakh at a glance; a
+    reader who grew up with this system has to count the digits of "250,000".
+
+    The panel pins Intl to en-IN throughout for the same reason, in the same
+    words — see admin/src/lib/format.ts — so a sentence generated here and one
+    typed by an operator now look alike. Written out rather than taken from
+    `locale`, which needs en_IN installed in the image and silently falls back
+    to the C locale when it is not: the wrong grouping would come back on the
+    server and nowhere a test could see it.
+    """
+    n = int(value)
+    digits = str(abs(n))
+    if len(digits) > 3:
+        head, tail = digits[:-3], digits[-3:]
+        groups = []
+        while len(head) > 2:
+            groups.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            groups.insert(0, head)
+        digits = ",".join(groups) + "," + tail
+    return ("-" if n < 0 else "") + digits
+
+
 def _rule_sentence(field_name: str, op: str, value) -> str:
     """What a blocked student is told, when the model did not say it.
 
@@ -468,7 +499,7 @@ def _rule_sentence(field_name: str, op: str, value) -> str:
         return f"This scheme needs a certified disability of {value}% or more."
     if field_name == "annual_family_income":
         return (f"This scheme is for families with an annual income of "
-                f"₹{int(value):,} or less.")
+                f"₹{_rupees(value)} or less.")
     if field_name == "course_level":
         levels = ", ".join(str(v).replace("_", " ").lower() for v in _as_list(value))
         return f"This scheme is for students at these levels of study: {levels}."
@@ -512,10 +543,41 @@ def _clean_rules(raw, issues: list[str]) -> list[dict]:
                 issues.append(f"rule dropped: {name!r} is not a rule field")
             continue
 
-        op = str(r.get("op") or PROPOSABLE_RULES[name]).strip().upper()
-        if op not in RULE_OPS:
-            issues.append(f"rule dropped: {name} has operator {op!r}")
-            continue
+        # The comparison is a property of the field, not an answer.
+        #
+        # This used to take the model's operator and check it against RULE_OPS —
+        # every operator the API accepts, ten of them — so
+        # `annual_family_income GTE 10000` passed. GTE is a real operator, and
+        # that no income condition on any scholarship is a floor was checked by
+        # nothing.
+        #
+        # What that costs is the worst failure in this pipeline, because no part
+        # of it looks wrong. The rule is well-formed, the API stores it, the
+        # matcher evaluates it, the panel renders it — and the scheme meant for
+        # families under Rs 2.5 lakh now matches families above it and turns away
+        # every student it was written for. No error is raised and no row is
+        # missing.
+        #
+        # So the operator is not read. PROPOSABLE_RULES already declares the one
+        # each field takes: a certificate percentage is always a floor, an income
+        # figure always a ceiling, a set of levels always membership.
+        #
+        # That is not the coercion this function refuses everywhere else.
+        # Coercing a *value* means guessing what a notice said; this is refusing
+        # to let the model overwrite a constant the prompt handed it.
+        #
+        # The disagreement is still reported, and not only for the operator's
+        # sake — a reading that reversed the comparison was not a careful one,
+        # and the figure attached to it is worth a second look.
+        op = PROPOSABLE_RULES[name]
+        proposed = str(r.get("op") or op).strip().upper()
+        corrected = proposed != op
+        if corrected:
+            issues.append(
+                f"rule {name}: the model proposed {proposed}, which is not the "
+                f"comparison this field takes — {op} was used instead. Check the "
+                "figure as well: a reading that reversed the comparison may have "
+                "taken the number from the wrong sentence.")
 
         value = r.get("value")
         if value is None or value == [] or value == "":
@@ -572,8 +634,20 @@ def _clean_rules(raw, issues: list[str]) -> list[dict]:
             if value == int(value):
                 value = int(value)
 
+        # A sentence written to match a comparison that has just been corrected
+        # describes the opposite rule, and it is the sentence a blocked student
+        # is shown in place of the scheme. Left alone, a ceiling of Rs 10,000
+        # would refuse them with "for families earning Rs 10,000 a year or
+        # more" — the reverse of the reason they were refused. So the correction
+        # takes the sentence with it.
         description = str(r.get("description") or "").strip()
-        if len(description) < 10 or len(description) > 240:
+        if corrected:
+            description = _rule_sentence(name, op, value)
+            issues.append(
+                f"rule {name}: its refusal sentence was written for the {proposed} "
+                "the model proposed, so it said the opposite of the rule and was "
+                "replaced — check the wording")
+        elif len(description) < 10 or len(description) > 240:
             description = _rule_sentence(name, op, value)
             issues.append(
                 f"rule {name}: the refusal sentence was generated from the rule, "
@@ -612,7 +686,13 @@ def extract(url: str, allowed_tags: list[str], api_key: str | None = None) -> Pr
     field map the operator never sees.
     """
     tags = ", ".join(allowed_tags) if allowed_tags else "(none available)"
-    rule_fields = ", ".join(f"{k} ({v})" for k, v in PROPOSABLE_RULES.items())
+    # Each field with what a value on it means, rather than with its operator.
+    # Naming "LTE" here only invited the model to send an operator back, and the
+    # one it sent back was sometimes reversed; _clean_rules fills the comparison
+    # in from PROPOSABLE_RULES either way, so the prompt asks for the half the
+    # model is actually good at.
+    rule_fields = "\n".join(
+        f"    {name:<22}{RULE_MEANING[name]}" for name in PROPOSABLE_RULES)
 
     prompt = f"""Read this scholarship page and describe it: {url}
 
@@ -631,8 +711,14 @@ Use these exact values where a field is constrained:
   state codes       two-letter codes, e.g. MH, TN, UP, DL
 
 Eligibility rules are what the matcher evaluates, so state the conditions the
-notice actually gives, and only those. Available fields, with the operator each
-takes: {rule_fields}
+notice actually gives, and only those. The available fields, and what a value on
+each one means:
+
+{rule_fields}
+
+Give each rule a `field`, a `value` and a `description` — and no comparison. The
+comparison is fixed by the field: a disability percentage is always a minimum, an
+income figure is always a maximum, and a list is always the set that is accepted.
 
 Do not invent a rule the notice does not state. In particular, do not add a 40%
 disability rule unless the notice says so — a scheme silently given the usual
@@ -671,8 +757,10 @@ Answer as JSON:
   "important_notes": "quotas, caveats",
   "contact_email": "", "contact_phone": "",
   "tags": ["Engineering"],
-  "rules": [{{"field": "disability_percent", "op": "GTE", "value": 40,
-              "description": "This scheme needs a certified disability of 40% or more."}}]}}
+  "rules": [{{"field": "disability_percent", "value": 40,
+              "description": "This scheme needs a certified disability of 40% or more."}},
+            {{"field": "annual_family_income", "value": 250000,
+              "description": "This scheme is for families earning \u20b92.5 lakh a year or less."}}]}}
 
 external_url must be where the student applies — the scheme's own site or the
 official portal (NSP, AICTE), not an aggregator such as buddy4study.com or
