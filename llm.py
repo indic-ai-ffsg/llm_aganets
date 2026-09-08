@@ -38,10 +38,15 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from enums import COURSE_LEVELS, DISABILITY_TYPES  # noqa: E402
+# The month table, borrowed rather than copied. A model asked for YYYY-MM-DD
+# sometimes answers "31 October 2026" instead, and a third spelling of the
+# twelve months is a third one to keep in step.
+from extract import MONTHS  # noqa: E402
 from vocab import (  # noqa: E402
     AWARD_BASES, CHOICE_DOMAINS, PROPOSABLE_RULES, RULE_OPS, SPONSOR_TYPES,
 )
@@ -96,13 +101,19 @@ def _tool(kind: str):
     raise ValueError(f"unknown tool {kind!r}")
 
 
-def _ask(prompt: str, tool: str, api_key: str | None) -> str:
-    """One turn, with one tool, returning raw text.
+def _ask(prompt: str, tool: str | None, api_key: str | None) -> str:
+    """One turn, with at most one tool, returning raw text.
 
     No response_schema: a JSON schema and a search/browse tool cannot both be
     set on the same call, so the shape is asked for in the prompt and parsed
     defensively below. That is the trade the tools force, and it is why
     _as_json exists rather than trusting the transport.
+
+    `tool=None` is the translate stage, which has no page to find and none to
+    read — it is handed the text. It could therefore have a response_schema,
+    and does not: one parser for four stages is worth more than a marginally
+    stricter transport on one of them, and _as_json already handles everything
+    this model does to JSON.
     """
     from google.genai import types
 
@@ -112,7 +123,7 @@ def _ask(prompt: str, tool: str, api_key: str | None) -> str:
             model=MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                tools=[_tool(tool)],
+                tools=[_tool(tool)] if tool else None,
                 # Deterministic on purpose. Two runs over the same notice
                 # should propose the same income ceiling, and a reviewer who
                 # re-reads a proposal should see what they saw before.
@@ -164,6 +175,119 @@ def _as_json(text: str) -> dict | list:
     raise ModelError(f"reply was not JSON: {text[:200]}")
 
 
+# --- dates -------------------------------------------------------------------
+#
+# Dates get their own section because they are the field where the model's
+# failure is both characteristic and invisible. Asked when a scheme closes, a
+# model that has seen the page before will answer with the right day and month
+# and a year from whenever it saw it — confidently, in the requested format,
+# indistinguishable from a reading.
+#
+# What that costs is specific to this platform. The public directory selects
+#
+#     (closes_at IS NULL OR closes_at > now())
+#     AND (opens_at IS NULL OR opens_at <= now())
+#
+# (migration 0043), so a stale year does not show a student "this closed". It
+# takes the scheme off the site, and the panel goes on saying "Published". Not
+# knowing a date is safe here; guessing one is not, and every rule below follows
+# from that asymmetry.
+
+# Roughly eighteen months. A scholarship cycle is annual, so a window wider than
+# this is a year gone astray far more often than it is a real announcement.
+FAR_AHEAD_DAYS = 550
+
+
+def _iso(y: int, mon: int, d: int) -> str | None:
+    try:
+        return date(y, mon, d).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_date(raw) -> str | None:
+    r"""A date the model wrote, as YYYY-MM-DD, or None.
+
+    The prompt asks for ISO and usually gets it. The other three forms are what
+    comes back when the model has copied the notice's own wording, and reading
+    them is cheaper than dropping a date the page really does state.
+
+    Anything else is None rather than a guess. This replaces a bare
+    `re.fullmatch(r"\d{4}-\d{2}-\d{2}")`, which accepted 2026-13-45 — the Go
+    side then parsed it, failed, and stored no date at all, so an impossible
+    date and an absent one were the same thing and neither was reported.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+
+    months = "|".join(sorted(MONTHS, key=len, reverse=True))
+
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        return _iso(int(m[1]), int(m[2]), int(m[3]))
+
+    # Day first, which is how an Indian notice writes it and therefore how a
+    # model copying one writes it back.
+    m = re.fullmatch(r"(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{4})", s)
+    if m:
+        return _iso(int(m[3]), int(m[2]), int(m[1]))
+
+    m = re.fullmatch(
+        r"(\d{1,2})\s*(?:st|nd|rd|th)?\s+(?:of\s+)?(" + months + r")[a-z]*\.?,?\s+(\d{4})",
+        s, re.I)
+    if m:
+        return _iso(int(m[3]), MONTHS[m[2].lower()[:3]], int(m[1]))
+
+    m = re.fullmatch(
+        r"(" + months + r")[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", s, re.I)
+    if m:
+        return _iso(int(m[3]), MONTHS[m[1].lower()[:3]], int(m[2]))
+
+    return None
+
+
+def _date_issues(p: "Proposal", today: date | None = None) -> list[str]:
+    """What is suspicious about a proposal's dates, said rather than corrected.
+
+    Nothing here changes a value, because each of these is a thing a notice can
+    honestly say and the proposal is going to a person either way. They are
+    worth saying because none of them looks like a problem in the panel: a
+    listing with a stale closes_at is published, shows as Published, and is
+    absent from the directory, with nothing anywhere connecting the three.
+
+    The missing-deadline line is not a complaint. A listing with no closes_at is
+    publishable and is shown as open — that is what 0043 decided — and the note
+    exists so an operator knows that is what they are publishing.
+    """
+    today = today or date.today()
+    horizon = (today + timedelta(days=FAR_AHEAD_DAYS)).isoformat()
+    out: list[str] = []
+
+    if p.closes_at and p.closes_at < today.isoformat():
+        out.append(
+            f"closes_at {p.closes_at} has already passed, although the page was "
+            "judged open. Check the year — a closing date in the past removes the "
+            "scheme from the directory rather than showing it as closed.")
+    elif not p.closes_at:
+        out.append(
+            "no closing date was read. The listing can still be published and will "
+            "show as open, but a student is told nothing about when to apply by.")
+
+    if p.opens_at and p.opens_at > horizon:
+        out.append(
+            f"opens_at {p.opens_at} is more than eighteen months away, which would "
+            "keep the listing hidden until then. Check the year.")
+    if p.closes_at and p.closes_at > horizon:
+        out.append(
+            f"closes_at {p.closes_at} is more than eighteen months away, which is "
+            "longer than an annual cycle. Check the year.")
+
+    return out
+
+
 # --- stage 1: search ---------------------------------------------------------
 
 def search(query: str, api_key: str | None = None) -> list[str]:
@@ -175,8 +299,13 @@ def search(query: str, api_key: str | None = None) -> list[str]:
     """
     prompt = f"""Search for: {query}
 
+Today is {date.today().isoformat()}.
+
 Find URLs of specific scholarship programmes available to students with
 disabilities in India.
+
+Prefer the page for the cycle that is open or next to open. Where a scheme has
+a page per year, the current one is wanted and an archived earlier one is not.
 
 These must be education scholarships (school, college, university, or
 vocational) — not employment schemes, pensions, assistive device grants, or
@@ -207,6 +336,14 @@ class Verdict:
     is_scholarship: bool
     is_open: bool
     reason: str = ""
+    # The deadline the model says it judged on, where the page gave one.
+    #
+    # Not forwarded to the registry — extract reads the page again for that —
+    # and the Go client does not decode it. It is here to make `is_open`
+    # checkable: asked to commit to a date, a model is answerable for it, and
+    # the check below is the only part of this stage that is arithmetic rather
+    # than judgement.
+    closes_at: str | None = None
 
 
 def classify(url: str, api_key: str | None = None) -> Verdict:
@@ -217,6 +354,8 @@ def classify(url: str, api_key: str | None = None) -> Verdict:
     becomes a DRAFT for an operator to approve, never a published listing.
     """
     prompt = f"""Analyse this URL: {url}
+
+Today is {date.today().isoformat()}.
 
 1. Is this a scholarship, fellowship or grant for EDUCATION, available to
    students with disabilities in India?
@@ -231,21 +370,53 @@ def classify(url: str, api_key: str | None = None) -> Verdict:
      disability scholarships.
 
 2. Is it currently open or upcoming?
+   - Judge this against today's date above and against what the page says now,
+     never against a cycle you remember. A page you have seen before will have
+     moved on.
    - A deadline clearly passed with no sign of a new cycle: not open.
    - A recurring annual scholarship with no dates stated: treat as open.
+   - An annual scheme between cycles, whose page is still maintained: open. A
+     page rejected here is recorded and never read again, so being wrong in this
+     direction loses the scheme permanently.
    - Discontinued: not open.
 
+Give `closes_at` as the deadline the page states, in YYYY-MM-DD, so the answer
+can be checked. Use null if the page states none — do not supply one from
+memory.
+
 Answer as JSON:
-{{"is_scholarship": true, "is_open": true, "reason": "short reason if either is false"}}"""
+{{"is_scholarship": true, "is_open": true, "closes_at": "YYYY-MM-DD or null",
+  "reason": "short reason if either is false"}}"""
 
     data = _as_json(_ask(prompt, "url_context", api_key))
     if not isinstance(data, dict):
         raise ModelError("classify did not return an object")
-    return Verdict(
+
+    v = Verdict(
         is_scholarship=bool(data.get("is_scholarship")),
         is_open=bool(data.get("is_open")),
         reason=str(data.get("reason") or "")[:300],
+        closes_at=_parse_date(data.get("closes_at")),
     )
+
+    # The arithmetic corrects the judgement, and only in the direction that
+    # cannot lose a scheme.
+    #
+    # The asymmetry is in the backend, not here. A URL judged not-open is
+    # written into discovery_seen_url with its reason, and no later run reads it
+    # again — so a wrong "closed" is permanent, while a wrong "open" costs one
+    # draft that an operator declines in a second. A model that says closed
+    # while quoting a deadline that has not arrived is therefore overruled; one
+    # that says open is left alone, and extract's date checks pick up the rest.
+    if v.is_scholarship and not v.is_open and v.closes_at:
+        if v.closes_at >= date.today().isoformat():
+            v.is_open = True
+            v.reason = (
+                f"judged closed, but the deadline it quotes ({v.closes_at}) has not "
+                f"passed, so it is being read as open. Original reason: "
+                f"{v.reason or 'none given'}")[:300]
+
+    return v
 
 
 # --- stage 3: extract --------------------------------------------------------
@@ -421,6 +592,8 @@ def extract(url: str, allowed_tags: list[str], api_key: str | None = None) -> Pr
 
     prompt = f"""Read this scholarship page and describe it: {url}
 
+Today is {date.today().isoformat()}.
+
 It has already been judged a real education scholarship open to students with
 disabilities in India. Do not re-judge it — describe it.
 
@@ -444,6 +617,15 @@ Leave the list empty if the notice states no conditions.
 
 For each rule also write `description`: one sentence, 10-240 characters,
 addressed to a student who fails it, in the notice's own terms.
+
+Dates are read off the page, never remembered:
+
+  - opens_at and closes_at are YYYY-MM-DD.
+  - An Indian notice writes dates day first. 05/06/2026 is 5 June 2026.
+  - A day and month with no year mean the next such date that has not passed.
+  - If the page states no date, use null. Null is the safe answer: a listing
+    with no closing date is shown as open. A year carried over from an earlier
+    cycle is not — it removes the scheme from the site altogether.
 
 Answer as JSON:
 {{"title": "official name",
@@ -526,10 +708,11 @@ Convert lakh to digits: 1 lakh = 100000. Rupee figures as plain integers."""
 
     for key in ("opens_at", "closes_at"):
         raw = data.get(key)
-        if isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw.strip()):
-            setattr(p, key, raw.strip())
+        parsed = _parse_date(raw)
+        if parsed:
+            setattr(p, key, parsed)
         elif raw:
-            issues.append(f"{key} {raw!r} is not a YYYY-MM-DD date and was dropped")
+            issues.append(f"{key} {raw!r} could not be read as a date, and was dropped")
 
     if p.opens_at and p.closes_at and p.closes_at <= p.opens_at:
         # The API refuses this pair outright, so the weaker of the two goes and
@@ -537,6 +720,8 @@ Convert lakh to digits: 1 lakh = 100000. Rupee figures as plain integers."""
         issues.append(
             f"closes_at {p.closes_at} is not after opens_at {p.opens_at}; both dropped")
         p.opens_at = p.closes_at = None
+
+    issues.extend(_date_issues(p))
 
     docs = data.get("documents_required")
     if isinstance(docs, list):
@@ -570,3 +755,159 @@ Convert lakh to digits: 1 lakh = 100000. Rupee figures as plain integers."""
 
     p.issues = issues
     return p
+
+
+# --- stage 4: translate ------------------------------------------------------
+#
+# What the platform can store is narrower than what this produces, and the gap
+# is deliberate. `scholarship` has `summary_hi` and `description_hi` and nothing
+# else — two columns and one language, chosen when the site was English and
+# Hindi. Encoding that limit here would be this service deciding what the
+# catalogue can hold, which is the backend's business and not its own. So this
+# takes a list of languages; when a third one has somewhere to live, the backend
+# passes another code and nothing in this file changes.
+
+# The code a listing is stored under, and the name the model is asked in.
+#
+# A bare two-letter code in a prompt is not a reliable request: "or" is Odia and
+# also an English word, "as" likewise, and a model that misreads one returns
+# fluent text in the wrong language. Naming the language is what removes the
+# ambiguity — and a code that is not in this table is refused rather than
+# guessed at, because nobody in the review queue reads Odia well enough to catch
+# a translation that quietly is not one.
+LANGUAGE_NAMES: dict[str, str] = {
+    "as": "Assamese", "bn": "Bengali", "gu": "Gujarati", "hi": "Hindi",
+    "kn": "Kannada", "ml": "Malayalam", "mr": "Marathi", "ne": "Nepali",
+    "or": "Odia", "pa": "Punjabi", "sa": "Sanskrit", "sd": "Sindhi",
+    "ta": "Tamil", "te": "Telugu", "ur": "Urdu",
+}
+
+# Ceilings, when the caller names none. The backend passes the real ones per
+# field, because it is the side that knows the column widths.
+DEFAULT_LIMIT = 24000
+MAX_LANGUAGES = 8
+
+
+def translate(fields: dict[str, str], languages: list[str],
+              limits: dict[str, int] | None = None,
+              api_key: str | None = None) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Translate a listing's student-facing prose into each language asked for.
+
+    A call of its own rather than more of the extract prompt, and that is a
+    deliberate ~30-60s per drafted page. Extraction is the expensive thing to
+    lose: it has read the page, and its reply already carries twenty fields and
+    a rule list. Four languages of prose on top of that makes the reply that
+    fails to parse both bigger and likelier, and a failure there costs the
+    scholarship, not the translation. Separated, the worst case is an English
+    listing — which is what every discovered listing is today.
+
+    Returns the translations and the issues, rather than raising on a partial
+    answer. One language coming back unusable should not cost the others, and
+    none of this is worth failing a draft over.
+    """
+    limits = limits or {}
+    issues: list[str] = []
+
+    wanted: list[str] = []
+    for code in languages:
+        code = str(code).strip().lower()
+        if code in ("", "en"):
+            # English is the original, not a translation of it.
+            continue
+        if code not in LANGUAGE_NAMES:
+            issues.append(f"language {code!r} is not one this service will translate into")
+            continue
+        if code not in wanted:
+            wanted.append(code)
+
+    text = {k: v.strip() for k, v in fields.items() if isinstance(v, str) and v.strip()}
+    if not wanted or not text:
+        return {}, issues
+    if len(wanted) > MAX_LANGUAGES:
+        issues.append(f"only the first {MAX_LANGUAGES} languages were translated")
+        wanted = wanted[:MAX_LANGUAGES]
+
+    named = ", ".join(f"{LANGUAGE_NAMES[c]} (as \"{c}\")" for c in wanted)
+    prompt = f"""Translate the fields below into: {named}
+
+This is a scholarship listing shown to a student with a disability in India who
+is deciding whether they can apply. Translate it — do not summarise it, do not
+expand it, and do not add anything the English does not say.
+
+Keep unchanged, in every language:
+  - rupee figures, percentages, dates and any other number
+  - URLs, email addresses and phone numbers
+  - the official name of the scheme and of the organisation that runs it,
+    which are proper nouns. Where the name is normally written in the script of
+    the target language, use that; otherwise leave it in English rather than
+    inventing a translation of a name.
+
+Write plainly, addressed to the student, in the register a government notice
+would use if it had been written in that language to begin with — not a
+transliteration of English sentence structure.
+
+Do not translate the field names. Answer as JSON, one object per language code:
+
+{{{", ".join(f'"{c}": {{...}}' for c in wanted)}}}
+
+Each object has exactly these keys: {", ".join(text)}
+
+The English:
+
+{json.dumps(text, ensure_ascii=False, indent=2)}"""
+
+    data = _as_json(_ask(prompt, None, api_key))
+    if not isinstance(data, dict):
+        raise ModelError("translate did not return an object")
+
+    out = _take_translations(data, wanted, text, limits, issues)
+    return out, issues
+
+
+def _take_translations(data: dict, wanted: list[str], text: dict[str, str],
+                       limits: dict[str, int], issues: list[str]) -> dict[str, dict[str, str]]:
+    """Keep what came back that is usable, and say what was not.
+
+    Separate from translate() so it can be tested without a key. Everything
+    here is a judgement about a reply this service cannot otherwise reach, and
+    it is the half of the stage that has to be right when the model is having a
+    bad day.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for code in wanted:
+        block = data.get(code)
+        if not isinstance(block, dict):
+            issues.append(f"{LANGUAGE_NAMES[code]}: the model returned nothing usable")
+            continue
+
+        kept: dict[str, str] = {}
+        for name, english in text.items():
+            got = block.get(name)
+            if not isinstance(got, str) or not got.strip():
+                continue
+            got = got.strip()
+            if got == english:
+                # Not dropped: a scheme's official name is often left in English
+                # on purpose, and so is a URL. Said, because the other reason
+                # for it is a model that could not do the job and echoed the
+                # input, and those look identical from here.
+                issues.append(
+                    f"{LANGUAGE_NAMES[code]}: {name} came back identical to the "
+                    "English — check whether it was translated at all")
+            limit = limits.get(name, DEFAULT_LIMIT)
+            if len(got) > limit:
+                got = got[:limit]
+                issues.append(
+                    f"{LANGUAGE_NAMES[code]}: {name} was longer than the {limit} "
+                    "characters the column holds, and was cut")
+            kept[name] = got
+
+        missing = [n for n in text if n not in kept]
+        if missing:
+            issues.append(
+                f"{LANGUAGE_NAMES[code]}: no translation came back for "
+                + ", ".join(missing))
+        if kept:
+            out[code] = kept
+
+    return out

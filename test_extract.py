@@ -9,10 +9,16 @@ quietly wrong.
 """
 
 import sys
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extract  # noqa: E402
+
+# Fixed, because half of what follows is about a year the notice did not state.
+# A reference date taken from the clock would make these tests a different
+# question every year and a failing one every November.
+TODAY = date(2026, 9, 7)
 
 PASS = FAIL = 0
 
@@ -86,6 +92,61 @@ def main() -> None:
     check("2.5 lakh", extract.rupees("2.5", "lakh"), 250000)
     check("Indian grouping", extract.rupees("2,50,000", None), 250000)
     check("crore", extract.rupees("1", "crore"), 10000000)
+
+    print("\nDates, which are the field with the sharpest consequence")
+
+    def deadline(text, today=TODAY):
+        f = extract.find_closing_date(text, today)
+        return f.value if f else None
+
+    # The four forms a notice writes a dated deadline in.
+    check("ISO, as a portal's own markup gives it",
+          deadline("Last date: 2026-10-31 for all applicants."), "2026-10-31")
+    check("dotted, which the old numeric pattern could not read",
+          deadline("Last date: 31.10.2026"), "2026-10-31")
+    check("month first", deadline("Deadline: October 31, 2026"), "2026-10-31")
+    check("two-digit year", deadline("Apply before 31/10/26"), "2026-10-31")
+
+    # No year at all, which is common and was previously not read.
+    check("no year: the next one that has not passed",
+          deadline("Last date for submission: 31st October"), "2026-10-31")
+    check("no year, and this year's has gone",
+          deadline("Last date for submission: 31st October", date(2026, 11, 30)),
+          "2027-10-31")
+    check("no year, month first",
+          deadline("Applications close October 31"), "2026-10-31")
+    check("a year the notice does state is never inferred over",
+          deadline("Last date: 31 October 2027"), "2027-10-31")
+
+    # Refusing to answer, which is the right answer more often than it looks.
+    check("a date that does not exist is not rolled forward",
+          deadline("Last date: 31 February 2026"), None)
+    check("an unanchored date is not a deadline",
+          deadline("Issued on 12 March 2026 by the Department."), None)
+    check("29 February in a common year is refused, not moved",
+          deadline("Last date: 29/02/2026"), None)
+
+    # Written the American way. Only catchable when the day is above twelve —
+    # a bare 05/06/2026 is genuinely ambiguous and is read day-first.
+    check("MM/DD/YYYY is caught when it can be",
+          deadline("Apply by 10/31/2026"), "2026-10-31")
+    check("ambiguous is read day first, as an Indian notice writes it",
+          deadline("Apply by 05/06/2026"), "2026-06-05")
+
+    check("the year, when inferred, is flagged as inferred",
+          extract.find_closing_date("Last date: 31st October", TODAY).inferred, True)
+    check("a year read off the page is not flagged",
+          extract.find_closing_date("Last date: 31 October 2026", TODAY).inferred, False)
+
+    print("\nThe opening date, which is not the deadline reversed")
+    opening = extract.find_opening_date("Applications open on 01/08/2026.", TODAY)
+    check("an opening date with a year is read", opening.value, "2026-08-01")
+    # Never inferred forward: _next_such_day answers "the next one coming",
+    # which would hide the listing until then.
+    check("an opening date with no year is left alone",
+          extract.find_opening_date("Applications open on 1st August", TODAY), None)
+    check("the deadline's words do not read as the opening date",
+          extract.find_opening_date("Last date: 31 October 2026", TODAY), None)
 
     print("\nEvidence is carried")
     r = extract.read(TOP_CLASS)

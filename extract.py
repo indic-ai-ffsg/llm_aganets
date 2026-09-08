@@ -31,6 +31,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -54,6 +55,11 @@ class Field_:
     """
     value: object
     evidence: str
+    # True when part of the value was not on the page. Only dates set it: a
+    # notice reading "last date 31st October" with no year has been read
+    # correctly and then completed by inference, and those are two different
+    # claims to be making to an operator.
+    inferred: bool = False
 
 
 @dataclass
@@ -63,6 +69,7 @@ class Reading:
     state_codes: list[str] = field(default_factory=list)
     min_disability_percentage: Optional[Field_] = None
     max_family_income: Optional[Field_] = None
+    opening_date: Optional[Field_] = None
     closing_date: Optional[Field_] = None
     benefit_amount_max: Optional[Field_] = None
     evidence: dict[str, str] = field(default_factory=dict)
@@ -196,32 +203,144 @@ def find_percentage(text: str) -> Optional[Field_]:
     return None
 
 
-def find_closing_date(text: str) -> Optional[Field_]:
-    """The deadline, anchored on the words a notice uses for it.
+# The words a notice introduces each date with.
+#
+# Split, because the two dates are not symmetrical and the difference matters
+# below: a deadline with no year is the next one coming, and an opening date
+# with no year is usually behind us.
+CLOSING_WORDS = (r"(?:last\s+date|last\s+day|closing\s+date|deadline|due\s+date"
+                 r"|apply\s+(?:on\s+or\s+)?before|apply\s+by"
+                 r"|close[sd]?\s+on|applications?\s+close)")
+
+OPENING_WORDS = (r"(?:opening\s+date|start(?:ing)?\s+date|date\s+of\s+commencement"
+                 r"|applications?\s+open|opens?\s+on|apply\s+from"
+                 r"|registration\s+(?:starts|begins|opens))")
+
+
+def _calendar(y: int, mon: int, d: int) -> Optional[date]:
+    """The date, or None when the notice states one that does not exist.
+
+    "31 February" and "31/09" are typos a scholarship PDF really does contain,
+    and a parser that rolls them forward invents a deadline nobody wrote.
+    """
+    try:
+        return date(y, mon, d)
+    except ValueError:
+        return None
+
+
+def _next_such_day(mon: int, d: int, today: date) -> Optional[date]:
+    """The year a notice left out of a deadline.
+
+    "Last date: 31st October" means the next 31st October there is, because a
+    deadline is a thing in the future. Assuming the current year instead would
+    turn every notice read in November into one that closed last month — and a
+    closes_at in the past does not show a student "closed" on this platform, it
+    removes the scheme from the directory (migration 0043).
+    """
+    for y in (today.year, today.year + 1):
+        got = _calendar(y, mon, d)
+        if got and got >= today:
+            return got
+    return None
+
+
+def _dmy(a: str, b: str, c: str) -> Optional[date]:
+    """A d/m/y date, with the Indian order assumed and the American one caught.
+
+    DD/MM/YYYY is what an Indian notice writes, so that is the reading. A number
+    above twelve in the month position settles it either way round; a page
+    written MM/DD/YYYY is caught only when its day is above twelve, which is the
+    best a bare 05/06/2026 allows. The evidence span travels with the value, so
+    an operator can see which it was.
+    """
+    d, mon, y = int(a), int(b), int(c)
+    if y < 100:
+        y += 2000
+    if mon > 12 and d <= 12:
+        d, mon = mon, d
+    return _calendar(y, mon, d)
+
+
+def _date_forms() -> list[tuple[str, object, bool]]:
+    """The written forms, in the order they have to be tried.
+
+    The ones carrying a year come first, and that ordering is the point:
+    "31/10" is a prefix of "31/10/2026" and "31 October" is a prefix of
+    "31 October 2026", so reading a short form first would infer a year over one
+    the notice actually stated.
+
+    Every reader takes (groups, today) and returns a date or None. None is the
+    right answer far more often than a plausible date is — see the note above
+    CLOSING_WORDS about what a wrong date costs.
+    """
+    months = "|".join(sorted(MONTHS, key=len, reverse=True))
+    day = r"(\d{1,2})\s*(?:st|nd|rd|th)?\s*(?:of\s+)?"
+    month = r"(" + months + r")[a-z]*\.?,?\s*"
+
+    return [
+        # 2026-10-31 — what a portal's own markup gives.
+        (r"(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)",
+         lambda g, _t: _calendar(int(g[0]), int(g[1]), int(g[2])), False),
+        # 31st October 2026
+        (day + month + r"(\d{4})(?!\d)",
+         lambda g, _t: _calendar(int(g[2]), MONTHS[g[1].lower()[:3]], int(g[0])), False),
+        # October 31, 2026 — the comma is between the day and the year here,
+        # which is the one place `day` does not already allow for it.
+        (month + day + r",?\s*(\d{4})(?!\d)",
+         lambda g, _t: _calendar(int(g[2]), MONTHS[g[0].lower()[:3]], int(g[1])), False),
+        # 31/10/2026, 31-10-2026, 31.10.2026, 31/10/26
+        (r"(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})(?!\d)",
+         lambda g, _t: _dmy(g[0], g[1], g[2]), False),
+        # 31st October, with no year at all — common in Indian notices, and the
+        # reason these functions take a reference date. The lookahead keeps this
+        # off a year the form above would have read.
+        (day + r"(" + months + r")[a-z]*\.?(?!\s*,?\s*\d)",
+         lambda g, t: _next_such_day(MONTHS[g[1].lower()[:3]], int(g[0]), t), True),
+        # October 31, with no year
+        (r"(" + months + r")[a-z]*\.?,?\s*(\d{1,2})(?:st|nd|rd|th)?(?!\s*,?\s*\d)",
+         lambda g, t: _next_such_day(MONTHS[g[0].lower()[:3]], int(g[1]), t), True),
+    ]
+
+
+def _find_date(text: str, anchor: str, today: date, infer_year: bool) -> Optional[Field_]:
+    """A date, anchored on the words a notice uses to introduce it.
 
     Unanchored, the first date on the page is as likely to be the date the
     circular was issued — and a deadline read from the wrong line closes a
     scheme that is open, or opens one that has closed.
+
+    The gap between the anchor and the date excludes a full stop, so a match
+    cannot run out of one sentence and into an unrelated date in the next.
     """
-    anchor = r"(?:last\s+date|closing\s+date|deadline|apply\s+(?:on\s+or\s+)?before|due\s+date)"
-    months = "|".join(sorted(MONTHS, key=len, reverse=True))
-
-    for m in re.finditer(
-        anchor + r"[^.\n]{0,60}?(\d{1,2})\s*(?:st|nd|rd|th)?\s*"
-        r"(?:of\s+)?(" + months + r")[a-z]*\.?,?\s*(\d{4})",
-        text, re.I,
-    ):
-        d, mon, y = int(m.group(1)), MONTHS[m.group(2).lower()[:3]], int(m.group(3))
-        return Field_(f"{y:04d}-{mon:02d}-{d:02d}", _span(text, m))
-
-    for m in re.finditer(
-        anchor + r"[^.\n]{0,60}?(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", text, re.I,
-    ):
-        d, mon, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        y += 2000 if y < 100 else 0
-        if 1 <= mon <= 12 and 1 <= d <= 31:
-            return Field_(f"{y:04d}-{mon:02d}-{d:02d}", _span(text, m))
+    for pattern, reader, inferred in _date_forms():
+        if inferred and not infer_year:
+            continue
+        for m in re.finditer(anchor + r"[^.\n]{0,60}?" + pattern, text, re.I):
+            got = reader(m.groups(), today)
+            if got:
+                return Field_(got.isoformat(), _span(text, m), inferred)
     return None
+
+
+def find_closing_date(text: str, today: Optional[date] = None) -> Optional[Field_]:
+    """The deadline."""
+    return _find_date(text, CLOSING_WORDS, today or date.today(), infer_year=True)
+
+
+def find_opening_date(text: str, today: Optional[date] = None) -> Optional[Field_]:
+    """The date applications open, where the notice introduces one separately.
+
+    Worth reading for the same reason as the deadline and with the sign
+    reversed: the directory hides a listing whose opens_at has not arrived, so
+    an opening date landed a year late is a scheme nobody can see.
+
+    A year is never inferred for it. `_next_such_day` answers "the next one
+    coming", which is right for a deadline and wrong here — an opening date is
+    usually behind us, and guessing it forward would hide the listing for a
+    year. Without a year on the page, this returns nothing.
+    """
+    return _find_date(text, OPENING_WORDS, today or date.today(), infer_year=False)
 
 
 def find_award(text: str) -> Optional[Field_]:
@@ -276,9 +395,16 @@ def find_states(text: str) -> tuple[list[str], dict[str, str]]:
     return hits, evidence
 
 
-def read(text: str) -> Reading:
-    """Everything this notice says, with the words it said it in."""
+def read(text: str, today: Optional[date] = None) -> Reading:
+    """Everything this notice says, with the words it said it in.
+
+    `today` is the reference for a date the notice states without a year. It is
+    a parameter rather than a call to date.today() inside the reader so that a
+    test is not a different answer in November, and so the service reads a page
+    against one date for the whole of a request.
+    """
     text = clean(text)
+    today = today or date.today()
     r = Reading()
 
     r.disability_types, ev_d = find_words(text, DISABILITY_WORDS)
@@ -288,7 +414,8 @@ def read(text: str) -> Reading:
 
     r.min_disability_percentage = find_percentage(text)
     r.max_family_income = find_income(text)
-    r.closing_date = find_closing_date(text)
+    r.opening_date = find_opening_date(text, today)
+    r.closing_date = find_closing_date(text, today)
     r.benefit_amount_max = find_award(text)
     return r
 

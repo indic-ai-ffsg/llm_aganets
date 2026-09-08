@@ -22,7 +22,11 @@ ceiling, the closing date — and for each one this produces:
                  patterns are built for. Worth a look.
 
 Nothing here overrides the model. It annotates, because which reader is right
-is a judgement about the page, and that is the operator's.
+is a judgement about the page, and that is the operator's. The one value handed
+back rather than only described is the closing date, because the caller has a
+decision to make about it that it cannot make without the value — see
+`Check.closes_at`, and `settle_closing_date` in service.py for what is done with
+it and why the deadline in particular earns the exception.
 
 The fetch is a second network trip for a page the model already read through
 url_context. That is the cost of the check, and it is one HTTP GET against a
@@ -35,7 +39,9 @@ import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extract  # noqa: E402
@@ -59,6 +65,18 @@ class Check:
     # False when the page could not be fetched, so "the patterns found nothing"
     # is not mistaken for "the patterns disagreed".
     ran: bool = True
+
+    # What the patterns read for the deadline, where they read one.
+    #
+    # A reading, not a verdict. This module still only annotates — which reader
+    # is right about a page is a judgement and it is the operator's — but the
+    # deadline is the one field where the caller has a decision to make that it
+    # cannot make without the value, so the value is handed over. service.py
+    # decides what to do with it, and says why.
+    closes_at: Optional[str] = None
+    # True when the notice gave a day and a month and no year, so the year in
+    # `closes_at` was worked out rather than read off the page.
+    closes_at_inferred: bool = False
 
 
 def strip_html(html: str) -> str:
@@ -96,8 +114,14 @@ def _rule_value(rules: list[dict], field_name: str):
     return None
 
 
-def against(url: str, proposal_rules: list[dict], closes_at: str | None) -> Check:
-    """Compare a proposal's decisive numbers with what the patterns read."""
+def against(url: str, proposal_rules: list[dict], closes_at: str | None,
+            today: date | None = None) -> Check:
+    """Compare a proposal's decisive numbers with what the patterns read.
+
+    `today` is the reference for a deadline the notice states without a year,
+    passed in so one request reads a page against one date.
+    """
+    today = today or date.today()
     check = Check()
 
     try:
@@ -110,7 +134,7 @@ def against(url: str, proposal_rules: list[dict], closes_at: str | None) -> Chec
         check.notes.append(f"not independently checked: the page could not be fetched ({e})")
         return check
 
-    reading = extract.read(text)
+    reading = extract.read(text, today)
 
     comparisons = (
         ("certified disability", "disability_percent",
@@ -143,11 +167,23 @@ def against(url: str, proposal_rules: list[dict], closes_at: str | None) -> Chec
                 f"{unit}{pattern_value} — “{pattern_field.evidence}”. "
                 "Check before publishing.")
 
-    # The deadline is not a rule, so it is compared separately. A wrong one
-    # closes a scheme that is open, or opens one that has closed.
+    # The deadline is not a rule, so it is compared separately — and it is the
+    # comparison with the sharpest consequence. A wrong closing date does not
+    # show a student "closed": the public directory selects `closes_at > now()`
+    # (migration 0043), so a stale year takes the scheme off the site, and a
+    # date invented in the future keeps a dead scheme on it.
     if reading.closing_date:
-        check.evidence["closes_at"] = reading.closing_date.evidence
         pattern_date = reading.closing_date.value
+        check.evidence["closes_at"] = reading.closing_date.evidence
+        check.closes_at = pattern_date
+        check.closes_at_inferred = reading.closing_date.inferred
+
+        if reading.closing_date.inferred:
+            check.notes.append(
+                f"closing date: the notice gives a day and a month and no year "
+                f"(“{reading.closing_date.evidence}”), read as {pattern_date} — the "
+                "next one that has not passed. Check it against the scheme's cycle.")
+
         if closes_at and closes_at != pattern_date:
             check.notes.append(
                 f"closing date: the model said {closes_at}, the page reads "
@@ -156,5 +192,23 @@ def against(url: str, proposal_rules: list[dict], closes_at: str | None) -> Chec
             check.notes.append(
                 f"closing date: the page states {pattern_date} "
                 f"(“{reading.closing_date.evidence}”) and the proposal has none")
+    elif closes_at and closes_at < today.isoformat():
+        # Nothing to compare against, and the one date in play has already gone.
+        # Worth saying on its own, because this is the model's characteristic
+        # failure — the right day and month with a year from whenever it last
+        # saw the page — and it is invisible in the panel: the listing simply
+        # never appears in the directory.
+        check.notes.append(
+            f"closing date: the model said {closes_at}, which has already passed, "
+            "and the page states no deadline in a form the patterns read. A past "
+            "closing date removes the scheme from the directory rather than "
+            "showing it as closed — check the year before publishing.")
+
+    # The opening date, where the notice introduces one in its own words. Read
+    # for evidence only: it is not compared, because a notice that states an
+    # opening date and a proposal that omits one are not in disagreement, and
+    # the year is never inferred for it (see extract.find_opening_date).
+    if reading.opening_date:
+        check.evidence["opens_at"] = reading.opening_date.evidence
 
     return check

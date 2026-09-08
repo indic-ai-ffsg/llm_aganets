@@ -134,6 +134,82 @@ class ExtractRequest(BaseModel):
     verify: bool = True
 
 
+class TranslateRequest(BaseModel):
+    # field name -> the English text. Named by the caller rather than fixed
+    # here, because which fields have somewhere to be stored is the backend's
+    # question: today it is summary and description, and nothing in this
+    # service should have to change when that grows.
+    fields: dict[str, str] = Field(default_factory=dict, max_length=40)
+    languages: list[str] = Field(default_factory=lambda: ["hi"], max_length=8)
+    # Per-field character ceiling, from the backend, which is the side that
+    # knows the column widths. A translation over its ceiling is cut here and
+    # reported — the alternative is the registry refusing the whole draft, and
+    # losing a scholarship over an optional translation is the wrong trade.
+    limits: dict[str, int] = Field(default_factory=dict, max_length=40)
+    api_key: str | None = None
+
+
+# --- settling the deadline ---------------------------------------------------
+
+def settle_closing_date(proposal: llm.Proposal, check: crosscheck.Check,
+                        today: date | None = None) -> None:
+    """Decide the closing date where the two readers disagree, and say so.
+
+    The two are not equal evidence. The pattern reader's date arrived with the
+    sentence it was read from; the model's arrived with nothing, and the way it
+    goes wrong is specific — the right day and month, and a year from whenever it
+    last saw the page.
+
+    That failure is silent and it is expensive. The public directory selects
+    `closes_at > now()` (migration 0043), so a stale year does not show a student
+    that the scheme has closed. It removes the scheme from the site, while the
+    panel goes on reporting it as Published.
+
+    Two cases are settled here and no others:
+
+        the model gave none      the evidenced date is adopted
+        the model's has passed
+          and the page's has not the evidenced date wins
+
+    Everything else — two future dates that differ, two past ones — is left as
+    the model wrote it and annotated by crosscheck. That is the line this
+    service holds everywhere else: which reader is right about a page is a
+    judgement, and the operator reviewing the draft is the one making it. These
+    two are not judgements. One is a value against no value, and the other is
+    a comparison against today.
+    """
+    today = today or date.today()
+    read = check.closes_at
+    if not read:
+        return
+
+    if not proposal.closes_at:
+        proposal.closes_at = read
+        proposal.issues.append(
+            f"closing date {read} was read off the page by the pattern reader; the "
+            "model proposed none"
+            + (", and the notice gave no year, so it was taken as the next one "
+               "coming — check it" if check.closes_at_inferred else ""))
+    elif proposal.closes_at != read and proposal.closes_at < today.isoformat() <= read:
+        proposal.issues.append(
+            f"closing date: the model said {proposal.closes_at}, which has passed, and "
+            f"the page reads {read}. Using {read} — the model's date would have taken "
+            "the scheme out of the directory rather than showing it as closed.")
+        proposal.closes_at = read
+    else:
+        return
+
+    # The date just adopted may have crossed the opening date the model gave,
+    # and the API refuses a window that closes before it opens. The evidenced
+    # date stays and the unevidenced one goes, which is the same ordering of
+    # trust that got us here.
+    if proposal.opens_at and proposal.closes_at <= proposal.opens_at:
+        proposal.issues.append(
+            f"opens_at {proposal.opens_at} is not before the closing date "
+            f"{proposal.closes_at} that was read off the page, so it was dropped")
+        proposal.opens_at = None
+
+
 # --- routes ------------------------------------------------------------------
 
 @app.get("/healthz")
@@ -178,6 +254,22 @@ def do_classify(req: ClassifyRequest) -> dict:
     return {"url": req.url, **asdict(verdict)}
 
 
+@app.post("/translate", dependencies=[Depends(require_token)])
+def do_translate(req: TranslateRequest) -> dict:
+    """The student-facing prose, in each language asked for.
+
+    Separate from /extract on purpose, and the whole reason is the failure
+    mode: a translation that comes back unusable should cost the translation
+    and not the listing. See llm.translate.
+    """
+    try:
+        translations, issues = llm.translate(
+            req.fields, req.languages, req.limits, req.api_key)
+    except llm.ModelError as e:
+        raise HTTPException(502, str(e)) from e
+    return {"translations": translations, "issues": issues}
+
+
 @app.post("/extract", dependencies=[Depends(require_token)])
 def do_extract(req: ExtractRequest) -> dict:
     try:
@@ -193,6 +285,9 @@ def do_extract(req: ExtractRequest) -> dict:
         evidence = check.evidence
         verified = check.ran
         proposal.issues.extend(check.notes)
+        # After the notes, so the sentence explaining a swap reads after the one
+        # reporting the disagreement that caused it.
+        settle_closing_date(proposal, check)
 
     body = asdict(proposal)
     issues = body.pop("issues")

@@ -13,6 +13,7 @@ nothing installed but the service's own dependencies.
 
 import os
 import sys
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,6 +24,7 @@ os.environ.setdefault("DISCOVERY_TOKEN", "test-token-not-a-real-secret")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+import crosscheck  # noqa: E402
 import llm  # noqa: E402
 import service  # noqa: E402
 
@@ -58,7 +60,6 @@ auth = {"X-Discovery-Token": os.environ["DISCOVERY_TOKEN"]}
 check("right token is served", client.get("/queries", headers=auth).status_code, 200)
 check("fifteen seed queries", len(client.get("/queries", headers=auth).json()["queries"]), 15)
 # The year is computed, not written, so a query does not go stale in January.
-from datetime import date  # noqa: E402
 check("current year in the first query",
       str(date.today().year) in client.get("/queries", headers=auth).json()["queries"][0], True)
 
@@ -131,6 +132,144 @@ print("\nA notice with no stated threshold gets no threshold")
 none: list[str] = []
 check("empty in, empty out", llm._clean_rules([], none), [])
 check("nothing invented", none, [])
+
+
+print("\nDates the model wrote, read or refused")
+check("ISO", llm._parse_date("2026-10-31"), "2026-10-31")
+check("day first, as an Indian notice writes it",
+      llm._parse_date("31/10/2026"), "2026-10-31")
+check("dotted", llm._parse_date("31.10.2026"), "2026-10-31")
+check("named month", llm._parse_date("31 October 2026"), "2026-10-31")
+check("month first", llm._parse_date("October 31, 2026"), "2026-10-31")
+# The shape check this replaced accepted these, and the Go side then stored no
+# date at all — so an impossible date and an absent one were the same thing.
+check("a month that does not exist", llm._parse_date("2026-13-01"), None)
+check("a day that does not exist", llm._parse_date("2026-02-31"), None)
+check("prose", llm._parse_date("some time in the autumn"), None)
+check("nothing", llm._parse_date(None), None)
+check("empty", llm._parse_date("   "), None)
+
+
+print("\nWhat is said about a proposal's dates")
+TODAY = date(2026, 9, 7)
+
+
+def issues_for(**kw):
+    return llm._date_issues(llm.Proposal(**kw), TODAY)
+
+
+check("a deadline that has passed is named",
+      any("has already passed" in i for i in issues_for(closes_at="2024-10-31")), True)
+check("and the reason is the one that matters",
+      any("removes the scheme from the directory" in i
+          for i in issues_for(closes_at="2024-10-31")), True)
+check("no deadline is said, not complained about",
+      any("no closing date was read" in i for i in issues_for()), True)
+check("a live deadline says nothing",
+      issues_for(closes_at="2026-10-31"), [])
+check("an opening date years out is named",
+      any("more than eighteen months away" in i
+          for i in issues_for(closes_at="2026-10-31", opens_at="2029-01-01")), True)
+
+
+print("\nSettling the deadline between the two readers")
+
+
+def settled(model_date, pattern_date, inferred=False, opens_at=None):
+    p = llm.Proposal(title="x", closes_at=model_date, opens_at=opens_at)
+    c = crosscheck.Check(closes_at=pattern_date, closes_at_inferred=inferred)
+    service.settle_closing_date(p, c, TODAY)
+    return p
+
+
+check("the page's date is adopted when the model gave none",
+      settled(None, "2026-10-31").closes_at, "2026-10-31")
+check("and the operator is told where it came from",
+      any("read off the page" in i for i in settled(None, "2026-10-31").issues), True)
+check("an inferred year is called out",
+      any("no year" in i for i in settled(None, "2026-10-31", inferred=True).issues), True)
+
+# The case this exists for: the model keeps the day and month and supplies a
+# year from whenever it last saw the page.
+check("a stale year loses to an evidenced live one",
+      settled("2024-10-31", "2026-10-31").closes_at, "2026-10-31")
+check("and the consequence is spelled out",
+      any("out of the directory" in i for i in settled("2024-10-31", "2026-10-31").issues), True)
+
+# Everything else is left alone: which reader is right is the operator's call.
+check("two future dates that differ are not settled here",
+      settled("2026-11-30", "2026-10-31").closes_at, "2026-11-30")
+check("and nothing is added to the issues",
+      settled("2026-11-30", "2026-10-31").issues, [])
+check("agreement changes nothing", settled("2026-10-31", "2026-10-31").issues, [])
+check("no pattern date, nothing to settle",
+      settled("2024-10-31", None).closes_at, "2024-10-31")
+
+# The adopted date can cross an opening date the model gave, and the API
+# refuses that pair outright.
+crossed = settled(None, "2026-10-31", opens_at="2026-12-01")
+check("an opening date past the adopted deadline is dropped", crossed.opens_at, None)
+check("and said", any("was dropped" in i for i in crossed.issues), True)
+
+
+print("\nTranslation asks for languages it can actually name")
+got, issues = llm.translate({"summary": "x"}, ["xx", "klingon"])
+check("an unknown code is refused, not guessed at", got, {})
+check("and named", any("'xx'" in i for i in issues), True)
+# English is the original. Asking for it is not an error and not a call.
+check("english is not translated into", llm.translate({"summary": "x"}, ["en"]), ({}, []))
+check("nothing to translate is not a call", llm.translate({}, ["hi"]), ({}, []))
+check("bengali is a language this will translate into", "bn" in llm.LANGUAGE_NAMES, True)
+
+
+print("\nWhat comes back from a translation, kept or reported")
+english = {"summary": "A scholarship for students with disabilities.",
+           "description": "The full description."}
+notes: list[str] = []
+kept = llm._take_translations(
+    {"hi": {"summary": "दिव्यांग विद्यार्थियों के लिए छात्रवृत्ति।",
+            "description": "पूरा विवरण।"}},
+    ["hi"], english, {}, notes)
+check("a good reply is kept", sorted(kept["hi"]), ["description", "summary"])
+check("and says nothing", notes, [])
+
+notes = []
+kept = llm._take_translations(
+    {"hi": {"summary": english["summary"], "description": "पूरा विवरण।"}},
+    ["hi"], english, {}, notes)
+check("text echoed back untranslated is kept but flagged",
+      any("identical to the English" in i for i in notes), True)
+check("and still stored, because a proper noun legitimately is",
+      kept["hi"]["summary"], english["summary"])
+
+notes = []
+kept = llm._take_translations(
+    {"hi": {"summary": "क" * 900, "description": "पूरा विवरण।"}},
+    ["hi"], english, {"summary": 600}, notes)
+check("a translation longer than its column is cut, not refused",
+      len(kept["hi"]["summary"]), 600)
+check("and the cut is reported", any("was cut" in i for i in notes), True)
+
+notes = []
+kept = llm._take_translations({"hi": "not an object"}, ["hi"], english, {}, notes)
+check("a language that came back unusable is dropped", kept, {})
+check("and named", any("nothing usable" in i for i in notes), True)
+
+notes = []
+kept = llm._take_translations(
+    {"hi": {"summary": "दिव्यांग विद्यार्थियों के लिए छात्रवृत्ति।"}},
+    ["hi"], english, {}, notes)
+check("a partial reply keeps what it has", list(kept["hi"]), ["summary"])
+check("and says what is missing",
+      any("no translation came back for description" in i for i in notes), True)
+
+
+print("\nThe translate route")
+check("needs the token too", client.post("/translate", json={}).status_code, 401)
+r = client.post("/translate", headers=auth,
+                json={"fields": {"summary": "x"}, "languages": ["xx"]})
+check("answers without a key when there is no call to make", r.status_code, 200)
+check("and reports the refused language", r.json()["translations"], {})
 
 
 print(f"\n{PASS} passed, {FAIL} failed")
