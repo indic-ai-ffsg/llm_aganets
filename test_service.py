@@ -134,6 +134,40 @@ check("empty in, empty out", llm._clean_rules([], none), [])
 check("nothing invented", none, [])
 
 
+print("\nA rule that permits everything is not a rule")
+# The engine tests presence before it evaluates, so an all-inclusive rule still
+# blocks a student who has not filled the field in — and whatever they answer,
+# they pass. That is the "add your gender to your profile" prompt that cannot
+# change any outcome.
+everything: list[str] = []
+allfour = llm._clean_rules([{
+    "field": "gender", "op": "IN",
+    "value": ["MALE", "FEMALE", "TRANSGENDER", "UNDISCLOSED"],
+    "description": "This scheme is open to applicants of any gender.",
+}], everything)
+check("all four genders is dropped", allfour, [])
+check("and the reason says why", any("restricts nobody" in i for i in everything), True)
+
+# The narrowing case still has to survive, or a women-only scheme stops being
+# women-only — which is the opposite failure and a worse one.
+somegenders: list[str] = []
+kept_one = llm._clean_rules([{
+    "field": "gender", "op": "IN", "value": ["FEMALE"],
+    "description": "This scheme is for women applicants only.",
+}], somegenders)
+check("a genuine restriction is kept", [r["value"] for r in kept_one], [["FEMALE"]])
+check("and nothing is said about it", somegenders, [])
+
+# Three of four is still a restriction, so it stays.
+partial: list[str] = []
+kept_three = llm._clean_rules([{
+    "field": "gender", "op": "IN",
+    "value": ["MALE", "FEMALE", "TRANSGENDER"],
+    "description": "This scheme is open to all but undisclosed applicants.",
+}], partial)
+check("a subset is kept", len(kept_three), 1)
+
+
 print("\nDates the model wrote, read or refused")
 check("ISO", llm._parse_date("2026-10-31"), "2026-10-31")
 check("day first, as an Indian notice writes it",

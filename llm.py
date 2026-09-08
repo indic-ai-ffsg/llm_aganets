@@ -532,6 +532,30 @@ def _clean_rules(raw, issues: list[str]) -> list[dict]:
                     "not a stored value")
             if not kept:
                 continue
+
+            # A choice rule that permits every value restricts nobody, and
+            # proposing one is worse than proposing none.
+            #
+            # The engine checks whether the profile HOLDS the field before it
+            # evaluates the rule (matching/engine.go: `if !present ||
+            # value.IsNull()` comes first), so an all-inclusive gender rule
+            # still blocks every student who has not stated a gender — and
+            # whatever they then answer, they pass. The student is sent to fill
+            # in a field that cannot change the answer.
+            #
+            # scholarship-vocabulary.ts warns about this in the panel, in these
+            # words: "Leave every box clear for a scheme open to everyone —
+            # that is what 'no restriction' means to the engine. Ticking all
+            # four is not the same thing and makes the matcher do work for
+            # nothing." A model listing every category it saw named on the page
+            # is exactly how that gets ticked.
+            if set(kept) >= set(allowed):
+                issues.append(
+                    f"rule {name}: dropped — it listed every possible value, so it "
+                    "restricts nobody, and a rule like that still blocks anyone who "
+                    "has not filled the field in")
+                continue
+
             value = kept
         else:
             try:
