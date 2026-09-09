@@ -272,8 +272,39 @@ def do_translate(req: TranslateRequest) -> dict:
 
 @app.post("/extract", dependencies=[Depends(require_token)])
 def do_extract(req: ExtractRequest) -> dict:
+    """One page, read.
+
+    The fetch happens here and once, and both readers get the same text. That
+    is the whole of the speed difference — a model asked to browse spends most
+    of the call waiting on somebody else's web server, and this service can wait
+    on it far more cheaply — and it is also what makes the cross-check exact,
+    because two separate fetches can return two different pages.
+
+    A refused fetch is not a failure. The model still has url_context, so the
+    read falls back to browsing and takes the old thirty to sixty seconds; what
+    is lost is the second reader, and crosscheck says so in its own words rather
+    than being quietly skipped.
+    """
+    page_text: str | None = None
+    fetch_error = ""
     try:
-        proposal = llm.extract(req.url, req.allowed_tags, req.api_key)
+        fetched = crosscheck.fetch_text(req.url)
+        if llm.too_thin(fetched):
+            # A successful fetch of nothing. See llm.MIN_PAGE_CHARS — this is
+            # what a JavaScript-rendered notice returns, and it is the case that
+            # would otherwise produce a confident draft made of a page title.
+            fetch_error = (
+                f"the page returned only {len(''.join(fetched.split()))} characters "
+                "of text, which is a page that builds itself in the browser")
+            log.info("thin page %s, falling back to url_context", req.url)
+        else:
+            page_text = fetched
+    except Exception as e:
+        fetch_error = repr(e)
+        log.info("could not fetch %s, falling back to url_context: %s", req.url, e)
+
+    try:
+        proposal = llm.extract(req.url, req.allowed_tags, req.api_key, page_text)
     except llm.ModelError as e:
         raise HTTPException(502, str(e)) from e
 
@@ -281,7 +312,13 @@ def do_extract(req: ExtractRequest) -> dict:
     verified = False
 
     if req.verify:
-        check = crosscheck.against(req.url, proposal.rules, proposal.closes_at)
+        if page_text is None:
+            proposal.issues.append(
+                "our own fetch of this page did not return readable text, so the "
+                "model read it through its own browser and nothing here was "
+                f"checked against the page independently — {fetch_error}")
+        check = crosscheck.against(
+            req.url, proposal.rules, proposal.closes_at, text=page_text)
         evidence = check.evidence
         verified = check.ran
         proposal.issues.extend(check.notes)

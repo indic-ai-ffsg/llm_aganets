@@ -28,9 +28,16 @@ decision to make about it that it cannot make without the value — see
 `Check.closes_at`, and `settle_closing_date` in service.py for what is done with
 it and why the deadline in particular earns the exception.
 
-The fetch is a second network trip for a page the model already read through
-url_context. That is the cost of the check, and it is one HTTP GET against a
-notice — cheap next to the two model calls either side of it.
+The fetch used to be a second network trip for a page the model had already
+read through url_context. It is not any more, and the reason is worth stating:
+the service now fetches once and hands the same text to both readers.
+
+That is faster, and it also makes this check mean more than it did. Two
+independent fetches can return two different pages — a rotating banner, a
+notice edited between them, a server answering differently to a browser and to
+a script — and a disagreement caused by that is a false alarm the operator
+cannot tell from a real one. Reading the same bytes, a disagreement is a
+disagreement about the reading.
 """
 
 from __future__ import annotations
@@ -115,24 +122,32 @@ def _rule_value(rules: list[dict], field_name: str):
 
 
 def against(url: str, proposal_rules: list[dict], closes_at: str | None,
-            today: date | None = None) -> Check:
+            today: date | None = None, text: str | None = None) -> Check:
     """Compare a proposal's decisive numbers with what the patterns read.
 
     `today` is the reference for a deadline the notice states without a year,
     passed in so one request reads a page against one date.
+
+    `text` is the page, where the caller already has it. Passing it is the
+    normal path now — the service fetches once and gives the same text to the
+    model and to this — and it is what makes the comparison exact rather than
+    approximate. Omitted, this fetches for itself, which is what happens when
+    the model had to browse because our own fetch was refused.
     """
     today = today or date.today()
     check = Check()
 
-    try:
-        text = fetch_text(url)
-    except Exception as e:
-        # Not an error for the run. The model read the page through its own
-        # tool; this reader simply could not, which is worth recording so the
-        # absence of notes is not read as agreement.
-        check.ran = False
-        check.notes.append(f"not independently checked: the page could not be fetched ({e})")
-        return check
+    if text is None:
+        try:
+            text = fetch_text(url)
+        except Exception as e:
+            # Not an error for the run. The model read the page through its own
+            # tool; this reader simply could not, which is worth recording so
+            # the absence of notes is not read as agreement.
+            check.ran = False
+            check.notes.append(
+                f"not independently checked: the page could not be fetched ({e})")
+            return check
 
     reading = extract.read(text, today)
 

@@ -129,6 +129,75 @@ check("short sentence is replaced", made[0]["description"],
 check("and the operator is told", any("generated from the rule" in i for i in generated), True)
 
 
+print("\nThe page is fetched here, not browsed by the model")
+# Where the thirty-to-sixty seconds went. A call carrying url_context is the
+# model deciding to browse, fetching, and waiting on a government web server
+# before it starts reading; handed the text it is one ordinary turn.
+_asked = {}
+_real_ask = llm._ask
+
+
+def _spy(prompt, tool, api_key):
+    _asked['tool'] = tool
+    _asked['prompt'] = prompt
+    return ('{"title": "Asha", "sponsor_name": "SBI Foundation", '
+            '"summary": "a summary comfortably over twenty characters", "rules": []}')
+
+
+llm._ask = _spy
+try:
+    llm.extract("https://x.test/scheme", ["Engineering"],
+                page_text="Family income not exceeding Rs. 2.50 lakh per annum.")
+    check("a page in hand means no browse tool", _asked['tool'], None)
+    check("and the page is in the prompt",
+          "----- the page -----" in _asked['prompt'], True)
+    check("and it still says where the page came from",
+          "https://x.test/scheme" in _asked['prompt'], True)
+
+    llm.extract("https://x.test/scheme", [])
+    check("no page means the model browses, as before", _asked['tool'], "url_context")
+finally:
+    llm._ask = _real_ask
+
+
+print("\nA page that builds itself in the browser is not a page")
+# The case that would otherwise ship a draft made of a page title. An HTTP GET
+# against a single-page app succeeds and returns a shell — the real
+# www.sbiashascholarship.co.in returns 351 characters, of which the content is
+# the <title>. Handing that to a model produces a confident answer from memory.
+check("a JavaScript shell is thin",
+      llm.too_thin("SBI Asha Scholarship 2026-27 | SBI Foundation\n\n\n" + " \n" * 90),
+      True)
+check("nothing fetched is thin", llm.too_thin(""), True)
+check("and so is nothing at all", llm.too_thin(None), True)
+check("a real notice is not",
+      llm.too_thin("Eligibility. " * 200), False)
+
+
+print("\nBoth readers are given the same bytes")
+# Two fetches can return two different pages — a rotating banner, a notice
+# edited between them — and a disagreement caused by that is a false alarm an
+# operator cannot tell from a real one.
+_fetched = []
+_real_fetch = crosscheck.fetch_text
+
+
+def _no_fetch(url, timeout=20.0):
+    _fetched.append(url)
+    raise AssertionError("fetched again when the text was already in hand")
+
+
+crosscheck.fetch_text = _no_fetch
+try:
+    chk = crosscheck.against("https://x.test/scheme", [], None,
+                             text="Last date to apply: 31 October 2026")
+    check("the supplied text is used", chk.ran, True)
+    check("nothing was fetched a second time", _fetched, [])
+    check("and it was read", chk.closes_at, "2026-10-31")
+finally:
+    crosscheck.fetch_text = _real_fetch
+
+
 print("\nThe comparison is the field's, not the model's")
 # The failure this section exists for: `annual_family_income GTE 10000` is a
 # well-formed rule the API accepts and the matcher evaluates, and it inverts who

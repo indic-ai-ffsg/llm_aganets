@@ -104,16 +104,13 @@ def _tool(kind: str):
 def _ask(prompt: str, tool: str | None, api_key: str | None) -> str:
     """One turn, with at most one tool, returning raw text.
 
-    No response_schema: a JSON schema and a search/browse tool cannot both be
-    set on the same call, so the shape is asked for in the prompt and parsed
-    defensively below. That is the trade the tools force, and it is why
-    _as_json exists rather than trusting the transport.
-
-    `tool=None` is the translate stage, which has no page to find and none to
-    read — it is handed the text. It could therefore have a response_schema,
-    and does not: one parser for four stages is worth more than a marginally
-    stricter transport on one of them, and _as_json already handles everything
-    this model does to JSON.
+    A tool and a JSON response type cannot both be set on the same call, so the
+    shape is asked for in the prompt and parsed defensively by _as_json. Where
+    there is no tool — translate, and the fast read that is handed the page —
+    the JSON mime type is set as well: it costs nothing, and it takes the fences
+    and the leading "Here is the JSON you asked for" out of the reply rather
+    than out of the parser. _as_json stays, because it is what catches the times
+    the mime type is ignored.
     """
     from google.genai import types
 
@@ -124,6 +121,7 @@ def _ask(prompt: str, tool: str | None, api_key: str | None) -> str:
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[_tool(tool)] if tool else None,
+                response_mime_type=None if tool else "application/json",
                 # Deterministic on purpose. Two runs over the same notice
                 # should propose the same income ceiling, and a reviewer who
                 # re-reads a proposal should see what they saw before.
@@ -677,13 +675,57 @@ def _clean_rules(raw, issues: list[str]) -> list[dict]:
     return deduped
 
 
-def extract(url: str, allowed_tags: list[str], api_key: str | None = None) -> Proposal:
+# How much of a page is worth sending. A stripped scholarship notice is a few
+# thousand characters; this is the ceiling for the outlier that inlines its
+# whole site in one document, and it is cut at the end rather than the start
+# because the eligibility table and the deadline are near the top and the
+# footer navigation is not.
+MAX_PAGE_CHARS = 120_000
+
+# Below this much actual text, a fetch has not read the page.
+#
+# The number is not arbitrary and the case is not rare. A single-page app serves
+# a shell — a <title>, a <noscript>, and the comments the build tool left — and
+# an HTTP GET against it returns a couple of hundred characters that look like a
+# successful fetch and contain no scheme. www.sbiashascholarship.co.in is one:
+# 351 characters, of which the only real content is the title.
+#
+# Handing that to the model is worse than not fetching at all. It would answer
+# from a title and its own memory, confidently, in the requested shape — and the
+# operator would get a draft that looks read rather than an obvious failure. So
+# a thin page is treated as no page, and the model browses it instead.
+#
+# 800 non-whitespace characters: a stripped notice runs to thousands, and the
+# thinnest real one is still an order of magnitude above a JavaScript shell.
+MIN_PAGE_CHARS = 800
+
+
+def too_thin(text: str | None) -> bool:
+    """Whether a fetched page has enough on it to be worth reading. See above."""
+    if not text:
+        return True
+    return len("".join(text.split())) < MIN_PAGE_CHARS
+
+
+def extract(url: str, allowed_tags: list[str], api_key: str | None = None,
+            page_text: str | None = None) -> Proposal:
     """Read one page into a proposed curated listing.
 
     `allowed_tags` comes from the backend, which reads it out of the listing_tag
     table. The vocabulary is closed and it is not an enum, so this service has
     no way to know it — and a tag invented here is refused by the API with a
     field map the operator never sees.
+
+    `page_text` is the page, already fetched. It is the difference between a
+    read that takes a few seconds and one that takes most of a minute, and the
+    reason is that url_context is not a faster way of doing the same thing: a
+    call carrying it is the model deciding to browse, issuing a fetch, waiting
+    on a government web server, and only then beginning to read. Handed the
+    text, none of that is in the call.
+
+    The browse path stays for the pages our own fetch cannot have — a 403 to a
+    non-browser user agent, a notice rendered by JavaScript. It is slow and it
+    is better than nothing, which is the right order of preference.
     """
     tags = ", ".join(allowed_tags) if allowed_tags else "(none available)"
     # Each field with what a value on it means, rather than with its operator.
@@ -768,7 +810,21 @@ myscheme.gov.in. If the page offers no application link, use {url}.
 
 Convert lakh to digits: 1 lakh = 100000. Rupee figures as plain integers."""
 
-    data = _as_json(_ask(prompt, "url_context", api_key))
+    if page_text:
+        # The page instead of an instruction to go and get it. Fenced and
+        # labelled so a notice containing the word "JSON", or its own set of
+        # instructions, reads as the thing being described rather than as part
+        # of the description.
+        prompt = (
+            prompt.replace(f"Read this scholarship page and describe it: {url}",
+                           f"Read the scholarship page below and describe it.\n"
+                           f"It was fetched from: {url}")
+            + "\n\n----- the page -----\n"
+            + page_text[:MAX_PAGE_CHARS]
+            + "\n----- end of page -----"
+        )
+
+    data = _as_json(_ask(prompt, None if page_text else "url_context", api_key))
     if not isinstance(data, dict):
         raise ModelError("extract did not return an object")
 
